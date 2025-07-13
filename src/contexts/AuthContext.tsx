@@ -15,6 +15,7 @@ interface AuthContextType {
   signOut: () => Promise<void>;
   isAdmin: boolean;
   isStudent: boolean;
+  refreshProfile: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -36,10 +37,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
+  const [profileRetryCount, setProfileRetryCount] = useState(0);
 
-  const fetchUserProfile = async (userId: string): Promise<Profile | null> => {
+  const fetchUserProfile = async (userId: string, retryCount: number = 0): Promise<Profile | null> => {
     try {
-      console.log('🔄 Fetching profile for user:', userId);
+      console.log(`🔄 Fetching profile for user: ${userId} (attempt ${retryCount + 1})`);
       
       const { data, error } = await supabase
         .from('profiles')
@@ -49,6 +51,45 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
       if (error) {
         console.error('❌ Error fetching profile:', error);
+        
+        // If profile doesn't exist, try to create it
+        if (error.code === 'PGRST116' && retryCount < 2) {
+          console.log('🔄 Profile not found, attempting to create...');
+          
+          // Try to get user info from auth
+          const { data: authData } = await supabase.auth.getUser();
+          
+          if (authData.user) {
+            const profileData = {
+              id: authData.user.id,
+              email: authData.user.email || '',
+              full_name: authData.user.user_metadata?.full_name || null,
+              role: authData.user.user_metadata?.role || 'student' as 'admin' | 'student',
+            };
+
+            const { data: newProfile, error: createError } = await supabase
+              .from('profiles')
+              .insert(profileData)
+              .select()
+              .single();
+
+            if (createError) {
+              console.error('❌ Error creating profile:', createError);
+              return null;
+            }
+
+            console.log('✅ Profile created successfully:', newProfile.role);
+            return newProfile;
+          }
+        }
+        
+        // Retry on network errors
+        if (error.message.includes('Failed to fetch') && retryCount < 3) {
+          console.log(`🔄 Network error, retrying... (${retryCount + 1}/3)`);
+          await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+          return fetchUserProfile(userId, retryCount + 1);
+        }
+        
         return null;
       }
 
@@ -56,7 +97,22 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return data;
     } catch (error) {
       console.error('❌ Error fetching profile:', error);
+      
+      // Retry on network errors
+      if (retryCount < 3) {
+        console.log(`🔄 Retrying profile fetch... (${retryCount + 1}/3)`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+        return fetchUserProfile(userId, retryCount + 1);
+      }
+      
       return null;
+    }
+  };
+
+  const refreshProfile = async () => {
+    if (user?.id) {
+      const userProfile = await fetchUserProfile(user.id);
+      setProfile(userProfile);
     }
   };
 
@@ -151,7 +207,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       console.log('🔄 Starting sign in process...');
       
       const { data, error } = await supabase.auth.signInWithPassword({
-        email: email.trim(),
+        email: email.trim().toLowerCase(),
         password,
       });
       
@@ -179,11 +235,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
       console.log('🔄 Starting sign up process...');
       
       const { data, error } = await supabase.auth.signUp({
-        email: email.trim(),
+        email: email.trim().toLowerCase(),
         password,
+        options: {
+          data: {
+            full_name: fullName,
+            role: role,
+          }
+        }
       });
 
       if (error) {
+        console.error('❌ Sign up error:', error);
         return { error };
       }
 
@@ -191,7 +254,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         // Create profile
         const profileData = {
           id: data.user.id,
-          email: email.trim(),
+          email: email.trim().toLowerCase(),
           full_name: fullName,
           role,
         };
@@ -230,6 +293,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setUser(null);
       setProfile(null);
       setSession(null);
+      setProfileRetryCount(0);
       
     } catch (error) {
       console.error('❌ Sign out error:', error);
@@ -249,6 +313,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     signOut,
     isAdmin,
     isStudent,
+    refreshProfile,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
